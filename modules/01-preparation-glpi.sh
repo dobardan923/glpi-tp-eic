@@ -1,33 +1,21 @@
 
 #!/usr/bin/env bash
 # =============================================================================
-# GLPI TP EIC - Module 01 : Préparation initiale
+# GLPI TP EIC - MODULE 01
+# Préparation du référentiel pédagogique
 #
-# Environnement : AlmaLinux / GLPI 12
-# API           : REST legacy (/apirest.php)
-# Projet        : https://github.com/dobardan923/glpi-tp-eic
+# Compatibilité : AlmaLinux / GLPI 12 / API REST legacy
+# Dépôt : https://github.com/dobardan923/glpi-tp-eic
 #
-# Ce script :
-#   1. Vérifie l'API GLPI
-#   2. Crée ou vérifie les utilisateurs
-#   3. Attribue les habilitations manquantes
-#   4. Prépare les lieux de l'EIC
-#   5. Prépare les types de matériel
-#   6. Prépare les fabricants
-#   7. Prépare les modèles d'ordinateurs
-#   8. Prépare les OS et leurs versions
-#   9. Prépare les statuts
-#  10. Prépare les catégories ITIL
-#  11. Prépare les sources de demandes
+# Version : 1.2
 #
-# Principes :
-#   - Ne supprime aucun élément.
-#   - Ne change aucun mot de passe existant.
-#   - Ne crée pas volontairement de doublons.
-#   - Ne modifie pas les objets existants.
-#   - Arrête le traitement si l'API refuse une opération.
-#
-# Les tickets et les équipements seront ajoutés dans d'autres modules.
+# Corrections :
+# - Pagination GLPI plus défensive
+# - Arrêt sur page incomplète ou fin de résultats
+# - Gestion des erreurs HTTP et JSON
+# - Aucun message de création réussie sans ID valide
+# - Pas de doublons volontaires
+# - Aucune suppression ni réinitialisation des mots de passe existants
 # =============================================================================
 
 set -Eeuo pipefail
@@ -39,47 +27,45 @@ umask 077
 
 GLPI_URL="${GLPI_URL:-http://127.0.0.1}"
 GLPI_URL="${GLPI_URL%/}"
-
 API_URL="${GLPI_URL}/apirest.php"
 
 GLPI_LOGIN="${GLPI_LOGIN:-glpi}"
 GLPI_PASSWORD="${GLPI_PASSWORD:-}"
 GLPI_USER_TOKEN="${GLPI_USER_TOKEN:-}"
 GLPI_APP_TOKEN="${GLPI_APP_TOKEN:-}"
-
 TP_PASSWORD="${TP_PASSWORD:-}"
 
-# Entité racine
 GLPI_ENTITY_ID="${GLPI_ENTITY_ID:-0}"
-
-# 1 uniquement si certificat auto-signé dans le laboratoire
 CURL_INSECURE="${CURL_INSECURE:-0}"
 
-# Taille de page utilisée pour les listes GLPI
 PAGE_SIZE=50
+MAX_PAGES=200
+
+SESSION_TOKEN=""
 
 # =============================================================================
-# JOURNALISATION
+# AFFICHAGE
 # =============================================================================
 
 info() {
     printf '[INFO] %s\n' "$*" >&2
 }
 
-success() {
+ok() {
     printf '[OK] %s\n' "$*" >&2
 }
 
-warning() {
+warn() {
     printf '[WARN] %s\n' "$*" >&2
 }
 
-error() {
+fail() {
     printf '[ERREUR] %s\n' "$*" >&2
+    return 1
 }
 
-fatal() {
-    error "$*"
+die() {
+    fail "$*" || true
     exit 1
 }
 
@@ -88,52 +74,43 @@ fatal() {
 # =============================================================================
 
 check_requirements() {
-    local command_name
+    local cmd
 
-    for command_name in curl jq mktemp; do
-        command -v "$command_name" >/dev/null 2>&1 ||
-            fatal "Commande manquante : $command_name"
+    for cmd in curl jq mktemp; do
+        command -v "$cmd" >/dev/null 2>&1 ||
+            die "Commande manquante : $cmd"
     done
 
     [[ "$GLPI_ENTITY_ID" =~ ^[0-9]+$ ]] ||
-        fatal "GLPI_ENTITY_ID doit être un entier."
+        die "Identifiant d'entité invalide."
 
-    info "Prérequis vérifiés."
+    ok "Prérequis vérifiés"
 }
-
-# =============================================================================
-# PRÉPARATION DES IDENTIFIANTS
-# =============================================================================
 
 prepare_credentials() {
     if [[ -z "$GLPI_USER_TOKEN" && -z "$GLPI_PASSWORD" ]]; then
-        read -r -s -p "Mot de passe administrateur GLPI : " GLPI_PASSWORD
+        read -r -s -p \
+            "Mot de passe administrateur GLPI : " \
+            GLPI_PASSWORD
         printf '\n' >&2
     fi
 
-    if [[ -z "$GLPI_USER_TOKEN" && -z "$GLPI_PASSWORD" ]]; then
-        fatal "Mot de passe GLPI absent."
-    fi
-
-    # Un mot de passe pédagogique est nécessaire uniquement
-    # pour les utilisateurs qui n'existent pas encore.
-    #
-    # Il est demandé à chaque lancement mais n'est jamais
-    # appliqué aux utilisateurs existants.
     if [[ -z "$TP_PASSWORD" ]]; then
-        read -r -s -p "Mot de passe initial des NOUVEAUX comptes TP : " TP_PASSWORD
+        read -r -s -p \
+            "Mot de passe initial des nouveaux comptes TP : " \
+            TP_PASSWORD
         printf '\n' >&2
     fi
 
     [[ -n "$TP_PASSWORD" ]] ||
-        fatal "Le mot de passe pédagogique ne peut pas être vide."
+        die "Mot de passe pédagogique vide."
 }
 
 # =============================================================================
-# CONFIGURATION CURL
+# HTTP
 # =============================================================================
 
-CURL_OPTIONS=(
+CURL_OPTS=(
     --silent
     --show-error
     --connect-timeout 10
@@ -141,7 +118,7 @@ CURL_OPTIONS=(
 )
 
 if [[ "$CURL_INSECURE" == "1" ]]; then
-    CURL_OPTIONS+=(--insecure)
+    CURL_OPTS+=(--insecure)
 fi
 
 API_HEADERS=(
@@ -154,83 +131,63 @@ if [[ -n "$GLPI_APP_TOKEN" ]]; then
     )
 fi
 
-SESSION_TOKEN=""
+# Effectue une requête API et renvoie son JSON.
+# Tous les autres messages passent par stderr.
 
-# =============================================================================
-# REQUÊTE HTTP CONTRÔLÉE
-# =============================================================================
-
-http_request() {
+api_request() {
     local method="$1"
     local endpoint="$2"
     local payload="${3-}"
 
-    local body_file
-    local headers_file
-    local status
-    local response
+    local tmp status response
+    tmp="$(mktemp)"
 
-    body_file="$(mktemp)"
-    headers_file="$(mktemp)"
-
-    local request_options=(
-        "${CURL_OPTIONS[@]}"
+    local options=(
+        "${CURL_OPTS[@]}"
         "${API_HEADERS[@]}"
+        -H "Session-Token: $SESSION_TOKEN"
         -X "$method"
-        -D "$headers_file"
-        -o "$body_file"
+        -o "$tmp"
         -w '%{http_code}'
     )
 
-    if [[ -n "$SESSION_TOKEN" ]]; then
-        request_options+=(
-            -H "Session-Token: $SESSION_TOKEN"
-        )
-    fi
-
     if [[ -n "$payload" ]]; then
-        request_options+=(
-            --data-binary "$payload"
-        )
+        options+=(--data-binary "$payload")
     fi
 
     if ! status="$(
-        curl "${request_options[@]}" \
-            "${API_URL}/${endpoint}"
+        curl "${options[@]}" "${API_URL}/${endpoint}"
     )"; then
-        rm -f "$body_file" "$headers_file"
-        error "Échec de communication : $method $endpoint"
+        rm -f "$tmp"
+        fail "Connexion impossible : $method $endpoint"
         return 1
     fi
 
-    response="$(cat "$body_file")"
-
-    rm -f "$body_file" "$headers_file"
+    response="$(cat "$tmp")"
+    rm -f "$tmp"
 
     case "$status" in
         200|201|206)
             ;;
         *)
-            error "HTTP $status : $method $endpoint"
-            error "Réponse GLPI : $response"
+            fail "HTTP $status : $method $endpoint"
+            printf '%s\n' "$response" >&2
             return 1
             ;;
     esac
 
     if ! jq -e . >/dev/null 2>&1 <<<"$response"; then
-        error "Réponse non JSON : $endpoint"
+        fail "Réponse JSON invalide : $endpoint"
         return 1
     fi
 
-    # GLPI peut retourner une erreur métier sous forme
-    # d'un tableau JSON.
     if jq -e '
         type == "array"
         and length > 0
         and (.[0] | type == "string")
         and (.[0] | startswith("ERROR"))
-    ' >/dev/null <<<"$response"; then
-        error "Erreur API GLPI : $response"
+    ' >/dev/null 2>&1 <<<"$response"; then
+        fail "Erreur métier GLPI : $response"
         return 1
     fi
 
@@ -238,45 +195,44 @@ http_request() {
 }
 
 # =============================================================================
-# SESSION GLPI
+# SESSION
 # =============================================================================
 
 open_session() {
-    local body_file status response
+    local tmp status response
+    local auth=()
 
     info "Connexion à $API_URL"
 
-    body_file="$(mktemp)"
-
-    local authentication=()
+    tmp="$(mktemp)"
 
     if [[ -n "$GLPI_USER_TOKEN" ]]; then
-        authentication+=(
+        auth+=(
             -H "Authorization: user_token $GLPI_USER_TOKEN"
         )
     else
-        authentication+=(
+        auth+=(
             -u "$GLPI_LOGIN:$GLPI_PASSWORD"
         )
     fi
 
     if ! status="$(
-        curl "${CURL_OPTIONS[@]}" \
+        curl "${CURL_OPTS[@]}" \
             "${API_HEADERS[@]}" \
-            "${authentication[@]}" \
-            -o "$body_file" \
+            "${auth[@]}" \
+            -o "$tmp" \
             -w '%{http_code}' \
             "$API_URL/initSession"
     )"; then
-        rm -f "$body_file"
-        fatal "Impossible de contacter l'API."
+        rm -f "$tmp"
+        die "Impossible de contacter l'API."
     fi
 
-    response="$(cat "$body_file")"
-    rm -f "$body_file"
+    response="$(cat "$tmp")"
+    rm -f "$tmp"
 
     if [[ "$status" != "200" ]]; then
-        fatal "Connexion refusée (HTTP $status) : $response"
+        die "Authentification refusée : HTTP $status : $response"
     fi
 
     SESSION_TOKEN="$(
@@ -284,14 +240,14 @@ open_session() {
     )"
 
     [[ -n "$SESSION_TOKEN" ]] ||
-        fatal "GLPI n'a retourné aucun Session-Token."
+        die "GLPI n'a pas retourné de session_token."
 
-    success "Session GLPI ouverte."
+    ok "Session GLPI ouverte"
 }
 
 close_session() {
     if [[ -n "$SESSION_TOKEN" ]]; then
-        curl "${CURL_OPTIONS[@]}" \
+        curl "${CURL_OPTS[@]}" \
             "${API_HEADERS[@]}" \
             -H "Session-Token: $SESSION_TOKEN" \
             "$API_URL/killSession" \
@@ -302,61 +258,52 @@ close_session() {
 trap close_session EXIT
 
 # =============================================================================
-# RECHERCHE DES OBJETS
+# LECTURE PAGINÉE
 # =============================================================================
 
-# Pour les référentiels pédagogiques, les listes restent petites.
-#
-# Une pagination est conservée pour les utilisateurs et les
-# habilitations, qui peuvent être plus nombreux.
-#
-# Pour les pages complètes, on regarde aussi le total déclaré
-# dans Content-Range afin de ne pas envoyer une requête hors plage.
-
 get_all() {
-    local type="$1"
+    local itemtype="$1"
     local offset=0
-    local end
-    local body_file headers_file
-    local status page count total range_header
+    local page_number=0
+    local end status count total
+    local page range_header
 
-    while :; do
+    local body_file headers_file
+
+    while (( page_number < MAX_PAGES )); do
         end=$((offset + PAGE_SIZE - 1))
 
         body_file="$(mktemp)"
         headers_file="$(mktemp)"
 
         if ! status="$(
-            curl "${CURL_OPTIONS[@]}" \
+            curl "${CURL_OPTS[@]}" \
                 "${API_HEADERS[@]}" \
                 -H "Session-Token: $SESSION_TOKEN" \
                 -D "$headers_file" \
                 -o "$body_file" \
                 -w '%{http_code}' \
-                "$API_URL/$type?range=$offset-$end"
+                "$API_URL/$itemtype?range=$offset-$end"
         )"; then
             rm -f "$body_file" "$headers_file"
-            error "Échec de lecture de $type"
+            fail "Lecture impossible : $itemtype"
             return 1
         fi
 
         page="$(cat "$body_file")"
 
         if [[ "$status" != "200" && "$status" != "206" ]]; then
-            error "Lecture de $type : HTTP $status"
-            error "$page"
             rm -f "$body_file" "$headers_file"
+            fail "Lecture $itemtype : HTTP $status : $page"
             return 1
         fi
 
         if ! jq -e 'type == "array"' \
             >/dev/null 2>&1 <<<"$page"; then
-            error "Réponse inattendue pour $type : $page"
             rm -f "$body_file" "$headers_file"
+            fail "Format de réponse inattendu pour $itemtype"
             return 1
         fi
-
-        jq -c '.[]' <<<"$page"
 
         count="$(jq 'length' <<<"$page")"
 
@@ -368,53 +315,68 @@ get_all() {
 
         rm -f "$body_file" "$headers_file"
 
+        # Certaines installations peuvent retourner une
+        # page vide lorsqu'on atteint les résultats disponibles.
+        # On termine sans effectuer une nouvelle requête.
+        if (( count == 0 )); then
+            if (( offset > 0 )); then
+                warn "$itemtype : fin de pagination à $offset"
+            fi
+            return 0
+        fi
+
+        # Chaque objet est émis sur une ligne JSON.
+        jq -c '.[]' <<<"$page"
+
+        offset=$((offset + count))
+        page_number=$((page_number + 1))
+
+        # Ne pas poursuivre après une page incomplète.
+        # C'est la correction principale.
+        if (( count < PAGE_SIZE )); then
+            return 0
+        fi
+
+        # Exploiter le total annoncé par GLPI s'il existe.
         if [[ "$range_header" =~ /([0-9]+)[[:space:]]*$ ]]; then
             total="${BASH_REMATCH[1]}"
 
-            offset=$((offset + count))
-
-            (( offset >= total )) && break
-
-        else
-            # Absence de Content-Range : fonctionnement
-            # de secours sur la taille des pages.
-            (( count < PAGE_SIZE )) && break
-
-            offset=$((offset + count))
+            if (( offset >= total )); then
+                return 0
+            fi
         fi
-
-        (( count > 0 )) ||
-            fatal "Pagination bloquée pour $type."
     done
+
+    fail "Limite de pagination atteinte : $itemtype"
+    return 1
 }
 
-find_named_item() {
-    local type="$1"
+# =============================================================================
+# RECHERCHE
+# =============================================================================
+
+find_by_name() {
+    local itemtype="$1"
     local name="$2"
 
-    local result
-    result="$(
-        get_all "$type" |
-            jq -sr --arg name "$name" '
-                [.[] | select(.name == $name)]
-                | if length > 1 then
-                    error("Nom non unique : " + $name)
-                  else
-                    .[0].id // empty
-                  end
-            '
-    )" || return 1
-
-    printf '%s\n' "$result"
+    get_all "$itemtype" |
+        jq -sr --arg name "$name" '
+            [.[] | select(.name == $name)]
+            | if length > 1 then
+                error("Plusieurs objets portent le nom " + $name)
+              else
+                .[0].id // empty
+              end
+        '
 }
 
-find_child_item() {
-    local type="$1"
+find_child() {
+    local itemtype="$1"
     local name="$2"
     local parent_field="$3"
     local parent_id="$4"
 
-    get_all "$type" |
+    get_all "$itemtype" |
         jq -sr \
             --arg name "$name" \
             --arg field "$parent_field" \
@@ -423,11 +385,11 @@ find_child_item() {
                 .[]
                 | select(
                     .name == $name
-                    and ((.[$field] | tostring) == $parent)
+                    and (.[$field] | tostring) == $parent
                 )
             ]
             | if length > 1 then
-                error("Plusieurs objets identiques : " + $name)
+                error("Doublons hiérarchiques : " + $name)
               else
                 .[0].id // empty
               end
@@ -435,27 +397,26 @@ find_child_item() {
 }
 
 # =============================================================================
-# CRÉATION DES OBJETS
+# CRÉATION D'OBJETS
 # =============================================================================
 
 create_object() {
-    local type="$1"
+    local itemtype="$1"
     local object="$2"
-
     local payload response id
 
-    jq -e 'type == "object"' \
-        >/dev/null <<<"$object" ||
-        fatal "Objet JSON invalide pour $type."
+    if ! jq -e 'type == "object"' \
+        >/dev/null 2>&1 <<<"$object"; then
+        fail "JSON invalide pour $itemtype"
+        return 1
+    fi
 
     payload="$(
-        jq -nc \
-            --argjson input "$object" \
-            '{input:$input}'
+        jq -nc --argjson input "$object" '{input:$input}'
     )" || return 1
 
     response="$(
-        http_request POST "$type" "$payload"
+        api_request POST "$itemtype" "$payload"
     )" || return 1
 
     id="$(
@@ -471,37 +432,29 @@ create_object() {
     )"
 
     if [[ ! "$id" =~ ^[0-9]+$ ]]; then
-        error "Création de $type sans identifiant valide."
-        error "$response"
+        fail "Aucun ID valide après création de $itemtype"
+        printf '%s\n' "$response" >&2
         return 1
     fi
 
     printf '%s\n' "$id"
 }
 
-# =============================================================================
-# OBJET SIMPLE
-# =============================================================================
-
 ensure_simple() {
-    local type="$1"
+    local itemtype="$1"
     local name="$2"
-
-    # Ne pas utiliser ${3:-{}} :
-    # cette expression peut produire du JSON invalide.
     local extra='{}'
+    local id object
 
     if (( $# >= 3 )); then
         extra="$3"
     fi
 
-    local id object
-
-    id="$(find_named_item "$type" "$name")" ||
+    id="$(find_by_name "$itemtype" "$name")" ||
         return 1
 
     if [[ -n "$id" ]]; then
-        success "$type : $name existe (ID $id)"
+        ok "$itemtype : $name existe (ID $id)"
         printf '%s\n' "$id"
         return 0
     fi
@@ -513,41 +466,31 @@ ensure_simple() {
             '$extra + {name:$name}'
     )" || return 1
 
-    id="$(create_object "$type" "$object")" ||
+    id="$(create_object "$itemtype" "$object")" ||
         return 1
 
-    success "$type : $name créé (ID $id)"
+    ok "$itemtype : $name créé (ID $id)"
     printf '%s\n' "$id"
 }
 
-# =============================================================================
-# OBJET HIÉRARCHIQUE
-# =============================================================================
-
 ensure_tree() {
-    local type="$1"
+    local itemtype="$1"
     local name="$2"
-    local parent_field="$3"
+    local field="$3"
     local parent_id="$4"
-
     local extra='{}'
+    local id object
 
     if (( $# >= 5 )); then
         extra="$5"
     fi
 
-    local id object
-
     id="$(
-        find_child_item \
-            "$type" \
-            "$name" \
-            "$parent_field" \
-            "$parent_id"
+        find_child "$itemtype" "$name" "$field" "$parent_id"
     )" || return 1
 
     if [[ -n "$id" ]]; then
-        success "$type : $name existe (ID $id)"
+        ok "$itemtype : $name existe (ID $id)"
         printf '%s\n' "$id"
         return 0
     fi
@@ -555,7 +498,7 @@ ensure_tree() {
     object="$(
         jq -nc \
             --arg name "$name" \
-            --arg field "$parent_field" \
+            --arg field "$field" \
             --argjson parent "$parent_id" \
             --argjson extra "$extra" '
             $extra + {
@@ -565,36 +508,35 @@ ensure_tree() {
         '
     )" || return 1
 
-    id="$(create_object "$type" "$object")" ||
+    id="$(create_object "$itemtype" "$object")" ||
         return 1
 
-    success "$type : $name créé (ID $id)"
+    ok "$itemtype : $name créé (ID $id)"
     printf '%s\n' "$id"
 }
 
 # =============================================================================
-# UTILISATEURS ET HABILITATIONS
+# PROFILS ET HABILITATIONS
 # =============================================================================
 
 get_profile_id() {
     local profile="$1"
     local id
 
-    id="$(find_named_item Profile "$profile")" ||
+    id="$(find_by_name Profile "$profile")" ||
         return 1
 
     if [[ -z "$id" ]]; then
-        error "Profil GLPI introuvable : $profile"
+        fail "Profil GLPI inexistant : $profile"
         return 1
     fi
 
     printf '%s\n' "$id"
 }
 
-ensure_profile_assignment() {
+ensure_profile() {
     local user_id="$1"
     local profile_name="$2"
-
     local profile_id existing object
 
     profile_id="$(get_profile_id "$profile_name")" ||
@@ -618,7 +560,7 @@ ensure_profile_assignment() {
     )" || return 1
 
     if [[ -n "$existing" ]]; then
-        success "Habilitation $profile_name déjà présente"
+        ok "Habilitation $profile_name déjà présente"
         return 0
     fi
 
@@ -634,23 +576,25 @@ ensure_profile_assignment() {
                 is_recursive:1
             }
         '
-    )"
+    )" || return 1
 
     create_object Profile_User "$object" >/dev/null ||
         return 1
 
-    success "Habilitation $profile_name attribuée"
+    ok "Habilitation $profile_name attribuée"
 }
+
+# =============================================================================
+# UTILISATEURS
+# =============================================================================
 
 ensure_user_email() {
     local user_id="$1"
     local email="$2"
-
     local existing object
 
-    # Lecture des adresses de cet utilisateur uniquement.
     existing="$(
-        http_request GET "User/$user_id/UserEmail" |
+        api_request GET "User/$user_id/UserEmail" |
             jq -r --arg email "$email" '
                 [.[] | select(.email == $email)]
                 | .[0].id // empty
@@ -658,7 +602,7 @@ ensure_user_email() {
     )" || return 1
 
     if [[ -n "$existing" ]]; then
-        success "E-mail $email déjà présent"
+        ok "E-mail $email déjà présent"
         return 0
     fi
 
@@ -672,62 +616,61 @@ ensure_user_email() {
                 is_default:1
             }
         '
-    )"
+    )" || return 1
 
     create_object UserEmail "$object" >/dev/null ||
         return 1
 
-    success "E-mail $email ajouté"
+    ok "E-mail $email ajouté"
 }
 
 ensure_user() {
     local login="$1"
-    local family_name="$2"
-    local first_name="$3"
+    local family="$2"
+    local firstname="$3"
     local email="$4"
     local profile="$5"
-
     local id object
 
-    id="$(find_named_item User "$login")" ||
+    id="$(find_by_name User "$login")" ||
         return 1
 
-    if [[ -n "$id" ]]; then
-        success "Utilisateur $login existe (ID $id)"
-    else
+    if [[ -z "$id" ]]; then
         object="$(
             jq -nc \
                 --arg login "$login" \
-                --arg family "$family_name" \
-                --arg first "$first_name" \
+                --arg family "$family" \
+                --arg firstname "$firstname" \
                 --arg password "$TP_PASSWORD" '
                 {
                     name:$login,
                     realname:$family,
-                    firstname:$first,
+                    firstname:$firstname,
                     password:$password,
                     password2:$password,
                     is_active:1,
                     authtype:1
                 }
             '
-        )"
+        )" || return 1
 
         id="$(create_object User "$object")" ||
             return 1
 
-        success "Utilisateur $login créé (ID $id)"
+        ok "Utilisateur $login créé (ID $id)"
+    else
+        ok "Utilisateur $login existe (ID $id)"
     fi
 
     ensure_user_email "$id" "$email" ||
         return 1
 
-    ensure_profile_assignment "$id" "$profile" ||
+    ensure_profile "$id" "$profile" ||
         return 1
 }
 
 # =============================================================================
-# MODULES DE DONNÉES
+# 1 - UTILISATEURS
 # =============================================================================
 
 prepare_users() {
@@ -758,23 +701,25 @@ prepare_users() {
         observateur1@eic.local Observer
 }
 
+# =============================================================================
+# 2 - LIEUX
+# =============================================================================
+
 prepare_locations() {
-    info "2/9 - Lieux de l'EIC"
+    info "2/9 - Lieux EIC"
 
     local eic aile_a room
 
-    eic="$(ensure_tree Location EIC locations_id 0)"
+    eic="$(ensure_tree Location EIC locations_id 0)" ||
+        return 1
 
     aile_a="$(
         ensure_tree Location "Aile A" locations_id "$eic"
-    )"
+    )" || return 1
 
-    for room in \
-        A32 A33 A34 A36 "Local technique"
-    do
-        ensure_tree \
-            Location "$room" locations_id "$aile_a" \
-            >/dev/null
+    for room in A32 A33 A34 A36 "Local technique"; do
+        ensure_tree Location "$room" locations_id "$aile_a" \
+            >/dev/null || return 1
     done
 
     for room in \
@@ -782,40 +727,44 @@ prepare_locations() {
         "Direction" \
         "Stock informatique"
     do
-        ensure_tree \
-            Location "$room" locations_id "$eic" \
-            >/dev/null
+        ensure_tree Location "$room" locations_id "$eic" \
+            >/dev/null || return 1
     done
 }
+
+# =============================================================================
+# 3 - TYPES MATÉRIELS
+# =============================================================================
 
 prepare_types() {
     info "3/9 - Types de matériel"
 
     local name
 
-    for name in \
-        "PC fixe" \
-        "PC portable" \
-        "Mini PC"
-    do
-        ensure_simple ComputerType "$name" >/dev/null
+    for name in "PC fixe" "PC portable" "Mini PC"; do
+        ensure_simple ComputerType "$name" >/dev/null ||
+            return 1
     done
 
-    ensure_simple MonitorType \
-        "Écran" >/dev/null
+    ensure_simple MonitorType "Écran" >/dev/null ||
+        return 1
 
-    ensure_simple PrinterType \
-        "Imprimante" >/dev/null
+    ensure_simple PrinterType "Imprimante" >/dev/null ||
+        return 1
+
+    ensure_simple NetworkEquipmentType "Switch" >/dev/null ||
+        return 1
 
     ensure_simple NetworkEquipmentType \
-        "Switch" >/dev/null
-
-    ensure_simple NetworkEquipmentType \
-        "Point d'accès Wi-Fi" >/dev/null
+        "Point d'accès Wi-Fi" >/dev/null || return 1
 
     ensure_simple PeripheralType \
-        "Vidéoprojecteur" >/dev/null
+        "Vidéoprojecteur" >/dev/null || return 1
 }
+
+# =============================================================================
+# 4 - FABRICANTS
+# =============================================================================
 
 prepare_manufacturers() {
     info "4/9 - Fabricants"
@@ -823,12 +772,16 @@ prepare_manufacturers() {
     local name
 
     for name in \
-        Dell HP Lenovo Acer Brother Epson \
-        Cisco Ubiquiti Samsung
+        Dell HP Lenovo Acer Brother Epson Cisco Ubiquiti Samsung
     do
-        ensure_simple Manufacturer "$name" >/dev/null
+        ensure_simple Manufacturer "$name" >/dev/null ||
+            return 1
     done
 }
+
+# =============================================================================
+# 5 - MODÈLES PC
+# =============================================================================
 
 prepare_models() {
     info "5/9 - Modèles d'ordinateurs"
@@ -845,21 +798,27 @@ prepare_models() {
         "Veriton X4710G" \
         "TravelMate P2"
     do
-        ensure_simple ComputerModel "$name" >/dev/null
+        ensure_simple ComputerModel "$name" >/dev/null ||
+            return 1
     done
 }
 
-prepare_operating_systems() {
+# =============================================================================
+# 6 - SYSTÈMES D'EXPLOITATION
+# =============================================================================
+
+prepare_os() {
     info "6/9 - Systèmes d'exploitation"
 
     local name
 
     for name in \
         "Microsoft Windows" \
-        "AlmaLinux" \
-        "Ubuntu"
+        AlmaLinux \
+        Ubuntu
     do
-        ensure_simple OperatingSystem "$name" >/dev/null
+        ensure_simple OperatingSystem "$name" >/dev/null ||
+            return 1
     done
 
     for name in \
@@ -870,9 +829,14 @@ prepare_operating_systems() {
         "AlmaLinux 10" \
         "Ubuntu 24.04 LTS"
     do
-        ensure_simple OperatingSystemVersion "$name" >/dev/null
+        ensure_simple OperatingSystemVersion "$name" \
+            >/dev/null || return 1
     done
 }
+
+# =============================================================================
+# 7 - STATUTS
+# =============================================================================
 
 prepare_states() {
     info "7/9 - Statuts matériels"
@@ -892,29 +856,26 @@ prepare_states() {
         "À recycler" \
         "Réformé"
     do
-        ensure_simple State "$name" >/dev/null
+        ensure_simple State "$name" >/dev/null ||
+            return 1
     done
 }
 
 # =============================================================================
-# CATÉGORIES ITIL
+# 8 - CATÉGORIES ITIL
 # =============================================================================
 
-prepare_category_group() {
+ITIL_OPTIONS='{
+    "is_helpdeskvisible":1,
+    "is_incident":1,
+    "is_request":1
+}'
+
+category_group() {
     local parent_name="$1"
     shift
 
     local parent_id name
-
-    # Catégories accessibles au support et au portail.
-    #
-    # Selon la version de GLPI, d'autres paramètres
-    # de visibilité peuvent également exister.
-    local options='{
-        "is_helpdeskvisible":1,
-        "is_incident":1,
-        "is_request":1
-    }'
 
     parent_id="$(
         ensure_tree \
@@ -922,7 +883,7 @@ prepare_category_group() {
             "$parent_name" \
             itilcategories_id \
             0 \
-            "$options"
+            "$ITIL_OPTIONS"
     )" || return 1
 
     for name in "$@"; do
@@ -931,61 +892,64 @@ prepare_category_group() {
             "$name" \
             itilcategories_id \
             "$parent_id" \
-            "$options" \
-            >/dev/null || return 1
+            "$ITIL_OPTIONS" >/dev/null || return 1
     done
 }
 
 prepare_categories() {
     info "8/9 - Catégories ITIL"
 
-    prepare_category_group "Matériel" \
+    category_group "Matériel" \
         "PC fixe" \
         "PC portable" \
         "Écran" \
         "Clavier / souris" \
-        "Périphérique USB"
+        "Périphérique USB" || return 1
 
-    prepare_category_group "Réseau" \
+    category_group "Réseau" \
         "Réseau filaire" \
         "Wi-Fi" \
         "Internet" \
         "VPN" \
-        "DNS / DHCP"
+        "DNS / DHCP" || return 1
 
-    prepare_category_group "Logiciel" \
+    category_group "Logiciel" \
         "Bureautique" \
         "Navigateur" \
         "Logiciel métier" \
         "Installation" \
         "Mise à jour" \
-        "Licence"
+        "Licence" || return 1
 
-    prepare_category_group "Accès" \
+    category_group "Accès" \
         "Compte utilisateur" \
         "Mot de passe" \
         "MFA" \
         "Droits d'accès" \
-        "Dossier partagé"
+        "Dossier partagé" || return 1
 
-    prepare_category_group "Impression" \
+    category_group "Impression" \
         "Impossible d'imprimer" \
         "File d'attente" \
         "Pilote" \
-        "Consommable"
+        "Consommable" || return 1
 
-    prepare_category_group "Demande de service" \
+    category_group "Demande de service" \
         "Installation" \
         "Matériel" \
         "Accès" \
-        "Information"
+        "Information" || return 1
 
-    prepare_category_group "Autre" \
-        "Demande non classée"
+    category_group "Autre" \
+        "Demande non classée" || return 1
 }
 
-prepare_request_sources() {
-    info "9/9 - Sources de demande"
+# =============================================================================
+# 9 - SOURCES DE DEMANDES
+# =============================================================================
+
+prepare_sources() {
+    info "9/9 - Sources de demandes"
 
     local name
 
@@ -997,7 +961,8 @@ prepare_request_sources() {
         "Demande orale" \
         "Supervision"
     do
-        ensure_simple RequestType "$name" >/dev/null
+        ensure_simple RequestType "$name" >/dev/null ||
+            return 1
     done
 }
 
@@ -1007,72 +972,61 @@ prepare_request_sources() {
 
 main() {
     echo
-    echo "========================================================"
-    echo " GLPI TP EIC - Module 01"
-    echo " Préparation du référentiel pédagogique"
-    echo "========================================================"
+    echo "======================================================"
+    echo " GLPI TP EIC - MODULE 01 - VERSION 1.2"
+    echo "======================================================"
     echo
 
     check_requirements
     prepare_credentials
     open_session
 
-    # On vérifie le compte et les profils avant de commencer.
-    info "Vérification des profils nécessaires"
+    info "Vérification des profils"
 
     local profile
 
     for profile in \
-        Self-Service \
-        Technician \
-        Hotliner \
-        Supervisor \
-        Observer
+        Self-Service Technician Hotliner Supervisor Observer
     do
         get_profile_id "$profile" >/dev/null ||
-            fatal "Profil requis indisponible : $profile"
+            die "Profil requis introuvable : $profile"
     done
 
-    success "Profils requis disponibles."
+    ok "Tous les profils nécessaires existent"
+
+    prepare_users || die "Échec de préparation des utilisateurs"
+    prepare_locations || die "Échec de préparation des lieux"
+    prepare_types || die "Échec de préparation des types matériels"
+    prepare_manufacturers || die "Échec des fabricants"
+    prepare_models || die "Échec des modèles"
+    prepare_os || die "Échec des systèmes d'exploitation"
+    prepare_states || die "Échec des statuts"
+    prepare_categories || die "Échec des catégories ITIL"
+    prepare_sources || die "Échec des sources de demandes"
 
     echo
-
-    prepare_users
-    prepare_locations
-    prepare_types
-    prepare_manufacturers
-    prepare_models
-    prepare_operating_systems
-    prepare_states
-    prepare_categories
-    prepare_request_sources
-
-    echo
-    echo "========================================================"
+    echo "======================================================"
     echo " MODULE 01 TERMINÉ"
-    echo "========================================================"
+    echo "======================================================"
     echo
-    echo "Référentiel traité :"
+    echo "Référentiel pédagogique préparé :"
     echo
-    echo "  - 8 utilisateurs et leurs habilitations"
-    echo "  - 10 lieux"
-    echo "  - 8 types de matériel"
-    echo "  - 9 fabricants"
-    echo "  - 8 modèles d'ordinateurs"
-    echo "  - 3 familles de systèmes d'exploitation"
-    echo "  - 6 versions de systèmes"
-    echo "  - 11 statuts matériels"
-    echo "  - 37 catégories ITIL (parents inclus)"
-    echo "  - 6 sources de demande"
+    echo "  8 utilisateurs et leurs habilitations"
+    echo "  10 lieux"
+    echo "  8 types de matériel"
+    echo "  9 fabricants"
+    echo "  8 modèles d'ordinateurs"
+    echo "  3 familles de systèmes d'exploitation"
+    echo "  6 versions de systèmes"
+    echo "  11 statuts matériels"
+    echo "  37 catégories ITIL"
+    echo "  6 sources de demande"
     echo
-    echo "Les éléments préexistants ont été conservés."
+    echo "Aucune donnée existante n'a été supprimée."
+    echo "Les mots de passe existants ont été conservés."
     echo
-    echo "Prochains modules :"
-    echo "  02 - Parc informatique"
-    echo "  03 - Tickets d'assistance"
-    echo "  04 - Scénarios pédagogiques"
-    echo
-    echo "========================================================"
+    echo "Prochain module : 02-parc-informatique.sh"
+    echo "======================================================"
 }
 
 main "$@"
