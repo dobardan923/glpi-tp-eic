@@ -279,6 +279,25 @@ log "Configuration du nom d'hote : $FQDN"
 hostnamectl set-hostname "$GLPI_HOSTNAME"
 
 log "Installation des paquets (dont git, wget, vim, jq)"
+# Configuration des dépôts AlmaLinux : utiliser baseurl au lieu de mirrorlist
+echo "[INFO] Configuration des dépôts AlmaLinux"
+
+for repo in /etc/yum.repos.d/almalinux-*.repo; do
+    [[ -f "$repo" ]] || continue
+
+    # Sauvegarde du fichier original
+    [[ -f "${repo}.bak" ]] || cp -p "$repo" "${repo}.bak"
+
+    # Désactivation de mirrorlist et activation de baseurl
+    sed -i \
+        -e '/^[[:space:]]*mirrorlist=/s/^/#/' \
+        -e '/^[[:space:]]*#[[:space:]]*baseurl=/s/^[[:space:]]*#[[:space:]]*//' \
+        "$repo"
+done
+
+# Actualisation du cache DNF
+dnf clean metadata
+dnf makecache --refresh
 dnf -y install \
     httpd mariadb-server \
     php php-cli php-fpm php-bcmath php-gd php-intl php-ldap \
